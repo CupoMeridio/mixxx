@@ -46,16 +46,27 @@ var DDJFLX2 = {
   // Helper: map a virtual deck number to its physical deck (1-based).
   // Virtual decks 1 and 3 map to physical deck 1 (left).
   // Virtual decks 2 and 4 map to physical deck 2 (right).
-  // This makes the left/right assignment explicit and independent
-  // of any modulo arithmetic over the virtual deck numbering scheme.
   virtualToPhysicalDeck: function (vDeckNo) {
     return (vDeckNo === 1 || vDeckNo === 3) ? 1 : 2;
   },
 
   // Helper: return the 0-based LED index for a virtual deck.
   // Physical deck 1 (left) → 0, physical deck 2 (right) → 1.
+  // NOTE: use only for play/cue/sync LEDs, NOT for pad LEDs.
   virtualToLedIndex: function (vDeckNo) {
     return this.virtualToPhysicalDeck(vDeckNo) - 1;
+  },
+
+  // Helper: return the correct MIDI OUT status byte for pad LEDs.
+  // Pioneer distinguishes MIDI-IN and MIDI-OUT channels for pads;
+  // these are the correct MIDI-OUT / illumination channels per the spec.
+  //   Left deck  normal : 0x97  shifted : 0x98
+  //   Right deck normal : 0x99  shifted : 0x9A
+  getPadLedStatus: function (physicalDeck, shifted) {
+    if (physicalDeck === 1) {
+      return shifted ? 0x98 : 0x97;
+    }
+    return shifted ? 0x9A : 0x99;
   },
 
   // Helper: return true only when vDeckNo is the virtual deck currently
@@ -64,6 +75,26 @@ var DDJFLX2 = {
   isVirtualDeckVisible: function (vDeckNo) {
     let physicalDeck = this.virtualToPhysicalDeck(vDeckNo);
     return this.vDeckNo[physicalDeck] === vDeckNo;
+  },
+
+  // Helper: extract hotcue pad number (1-8) from a hotcue mode control byte.
+  hotcuePadFromControl: function (control) {
+    return control + 1;
+  },
+
+  // Helper: extract loop pad number (1-8) from a loop mode control byte.
+  loopPadFromControl: function (control) {
+    return (control - 0x60) + 1;
+  },
+
+  // Helper: extract sampler pad number (1-8) from a sampler mode control byte.
+  samplerPadFromControl: function (control) {
+    return (control - 0x30) + 1;
+  },
+
+  // Helper: extract pad number from a pad FX mode control byte.
+  padFxPadFromControl: function (control) {
+    return (control & 0x07) + 1;
   },
 };
 
@@ -114,6 +145,8 @@ DDJFLX2.init = function () {
     });
 
     // Keep pad LEDs synchronized with hotcue state.
+    // This is the single source of truth for hotcue LED updates;
+    // hotcueNActivate must NOT send its own LED echo.
     for (let j = 1; j <= 8; j++) {
       engine.makeConnection(
         vgroup,
@@ -123,7 +156,12 @@ DDJFLX2.init = function () {
           let vDeckNo = script.deckFromGroup(vgroup);
           if (!DDJFLX2.isVirtualDeckVisible(vDeckNo)) { return; }
 
-          DDJFLX2.switchPadLED(DDJFLX2.virtualToLedIndex(vDeckNo), pad, ch);
+          DDJFLX2.switchPadLED(
+            DDJFLX2.virtualToPhysicalDeck(vDeckNo),
+            pad,
+            ch,
+            false
+          );
         }
       );
     }
@@ -181,8 +219,10 @@ DDJFLX2.LEDsOff = function () {
     midi.sendShortMsg(0x90 + i, 0x0b, 0x00);
     midi.sendShortMsg(0x90 + i, 0x0c, 0x00);
 
+    // Use the correct MIDI-OUT pad channels (0x97/0x98 for left, 0x99/0x9A for right).
+    let physicalDeck = i + 1;
     for (let j = 0; j <= 7; j++) {
-      midi.sendShortMsg(0x97 + 2 * i, j, 0x00);
+      midi.sendShortMsg(DDJFLX2.getPadLedStatus(physicalDeck, false), j, 0x00);
     }
   }
 };
@@ -486,7 +526,6 @@ DDJFLX2.syncLong = function (
   status,
   group
 ) {
-  // Blocca se shift è premuto: Shift+Sync va solo a padModeSelect
   if (DDJFLX2.isShiftPressed(group)) {
     return;
   }
@@ -684,6 +723,8 @@ DDJFLX2.cueGotoandstop = function (
 };
 
 // Trigger or create hotcues.
+// LED updates are handled exclusively by the makeConnection callback in init()
+// to avoid double-writes and race conditions.
 DDJFLX2.hotcueNActivate = function (
   channel,
   control,
@@ -691,26 +732,23 @@ DDJFLX2.hotcueNActivate = function (
   status,
   group
 ) {
-  if (value) {
-    let deck = DDJFLX2.resolveDeck(group);
-
-    let hotcueNum = control + 1;
-    let hotcue = "hotcue_" + hotcueNum;
-
-    engine.setValue(deck.group, hotcue + "_activate", true);
-
-    midi.sendShortMsg(
-      status,
-      control,
-      0x7f * engine.getValue(deck.group, hotcue + "_enabled")
-    );
-
-    midi.sendShortMsg(
-      0x90 + deck.physicalDeck - 1,
-      0x0b,
-      0x7f * engine.getValue(deck.group, "play")
-    );
+  if (!value) {
+    return;
   }
+
+  let deck = DDJFLX2.resolveDeck(group);
+  let hotcueNum = DDJFLX2.hotcuePadFromControl(control);
+  let hotcue = "hotcue_" + hotcueNum;
+
+  engine.setValue(deck.group, hotcue + "_activate", true);
+
+  // Update play LED immediately for responsiveness.
+  midi.sendShortMsg(
+    0x90 + deck.physicalDeck - 1,
+    0x0b,
+    0x7f * engine.getValue(deck.group, "play")
+  );
+  // NOTE: hotcue pad LED is handled by the makeConnection on hotcue_X_enabled.
 };
 
 // Clear hotcues.
@@ -721,76 +759,86 @@ DDJFLX2.hotcueNClear = function (
   status,
   group
 ) {
-  if (value) {
-    let deck = DDJFLX2.resolveDeck(group);
-
-    let hotcueNum = control + 1;
-
-    engine.setValue(
-      deck.group,
-      "hotcue_" + hotcueNum + "_clear",
-      true
-    );
-
-    midi.sendShortMsg(status, control, 0x00);
+  if (!value) {
+    return;
   }
-};
 
-DDJFLX2.padNumberFromControl = function (control) {
-  return (control & 0x07) + 1;
-};
+  let deck = DDJFLX2.resolveDeck(group);
+  let hotcueNum = DDJFLX2.hotcuePadFromControl(control);
 
-DDJFLX2.virtualDeckGroup = function (group) {
-  return DDJFLX2.resolveDeck(group).group;
+  engine.setValue(
+    deck.group,
+    "hotcue_" + hotcueNum + "_clear",
+    true
+  );
+
+  // Turn off the pad LED using the correct MIDI-OUT channel.
+  midi.sendShortMsg(
+    DDJFLX2.getPadLedStatus(deck.physicalDeck, false),
+    control,
+    0x00
+  );
 };
 
 DDJFLX2.applyPadFx = function (control, value, status, group, shifted) {
-  let pad = DDJFLX2.padNumberFromControl(control);
-  let padFxNo = pad + (shifted ? 8 : 0);
-  let slot = ((padFxNo - 1) % 3) + 1;
-  let intensity = 0.5 + 0.25 * Math.floor((padFxNo - 1) / 3);
+  let pad = DDJFLX2.padFxPadFromControl(control);
   let deck = DDJFLX2.resolveDeck(group);
-  let unit = deck.physicalDeck;
+
+  // Pads 4 and 8 are not handled in this mode.
+  if (pad === 4 || pad === 8) {
+    return;
+  }
+
+  // Map active pads to effect unit and slot:
+  // Pad 1,2,3 → unit A, slot 1,2,3
+  // Pad 5,6,7 → unit B, slot 1,2,3
+  // Physical deck 1 (left):  unit A = 1, unit B = 3
+  // Physical deck 2 (right): unit A = 2, unit B = 4
+  const padToUnitSlot = {
+    1: { unitOffset: 0, slot: 1 },
+    2: { unitOffset: 0, slot: 2 },
+    3: { unitOffset: 0, slot: 3 },
+    5: { unitOffset: 1, slot: 1 },
+    6: { unitOffset: 1, slot: 2 },
+    7: { unitOffset: 1, slot: 3 },
+  };
+  let unitOffset = padToUnitSlot[pad].unitOffset;
+  let slot = padToUnitSlot[pad].slot;
+
+  let unit;
+  if (deck.physicalDeck === 1) {
+    unit = unitOffset === 0 ? 1 : 3;
+  } else {
+    unit = unitOffset === 0 ? 2 : 4;
+  }
+
   let fxGroup = "[EffectRack1_EffectUnit" + unit + "]";
   let effectGroup = "[EffectRack1_EffectUnit" + unit + "_Effect" + slot + "]";
-  // Include deck.group in the key so that two virtual decks on the same
-  // physical side (4-deck mode) never share a save slot.
-  let stateKey = deck.group + ":" + status + ":" + control;
+  let stateKey = deck.group + ":" + unit + ":" + slot;
+
+  let ledStatus = DDJFLX2.getPadLedStatus(deck.physicalDeck, shifted);
 
   if (!value) {
     let saved = DDJFLX2.padFxState[stateKey];
-
     if (saved) {
       engine.setValue(fxGroup, "enabled", saved.enabled);
       engine.setValue(fxGroup, "mix", saved.mix);
       engine.setValue(effectGroup, "enabled", saved.effectEnabled);
       engine.setValue(effectGroup, "meta", saved.meta);
-
       for (let i = 1; i <= 4; i++) {
-        engine.setValue(
-          fxGroup,
-          "group_[Channel" + i + "]_enable",
-          saved.routing[i]
-        );
+        engine.setValue(fxGroup, "group_[Channel" + i + "]_enable", saved.routing[i]);
       }
-
       delete DDJFLX2.padFxState[stateKey];
     }
-
-    midi.sendShortMsg(status, control, 0x00);
+    midi.sendShortMsg(ledStatus, control, 0x00);
     return;
   }
 
   if (!DDJFLX2.padFxState[stateKey]) {
     let routing = {};
-
     for (let i = 1; i <= 4; i++) {
-      routing[i] = engine.getValue(
-        fxGroup,
-        "group_[Channel" + i + "]_enable"
-      );
+      routing[i] = engine.getValue(fxGroup, "group_[Channel" + i + "]_enable");
     }
-
     DDJFLX2.padFxState[stateKey] = {
       enabled: engine.getValue(fxGroup, "enabled"),
       mix: engine.getValue(fxGroup, "mix"),
@@ -803,14 +851,13 @@ DDJFLX2.applyPadFx = function (control, value, status, group, shifted) {
   for (let i = 1; i <= 4; i++) {
     engine.setValue(fxGroup, "group_[Channel" + i + "]_enable", 0);
   }
-
   engine.setValue(fxGroup, "group_" + deck.group + "_enable", 1);
   engine.setValue(fxGroup, "enabled", 1);
   engine.setValue(fxGroup, "mix", 1);
-  engine.setValue(effectGroup, "meta", Math.min(intensity, 1));
+  engine.setValue(effectGroup, "meta", 0.75);
   engine.setValue(effectGroup, "enabled", 1);
 
-  midi.sendShortMsg(status, control, 0x7f);
+  midi.sendShortMsg(ledStatus, control, 0x7f);
 };
 
 DDJFLX2.padFx = function (
@@ -840,7 +887,7 @@ DDJFLX2.loopRollPad = function (
   status,
   group
 ) {
-  let pad = DDJFLX2.padNumberFromControl(control);
+  let pad = DDJFLX2.loopPadFromControl(control);
   let size = DDJFLX2.loopPadSizes[pad - 1];
   let deck = DDJFLX2.resolveDeck(group);
 
@@ -850,7 +897,12 @@ DDJFLX2.loopRollPad = function (
     value ? 1 : 0
   );
 
-  midi.sendShortMsg(status, control, value ? 0x7f : 0x00);
+  // Use the correct MIDI-OUT channel for loop roll (shifted pad mode).
+  midi.sendShortMsg(
+    DDJFLX2.getPadLedStatus(deck.physicalDeck, true),
+    control,
+    value ? 0x7f : 0x00
+  );
 };
 
 DDJFLX2.samplerPad = function (
@@ -864,15 +916,16 @@ DDJFLX2.samplerPad = function (
     return;
   }
 
-  let pad = DDJFLX2.padNumberFromControl(control);
+  let pad = DDJFLX2.samplerPadFromControl(control);
   let deck = DDJFLX2.resolveDeck(group);
   let samplerNo = pad + (deck.physicalDeck - 1) * 8;
   let samplerGroup = "[Sampler" + samplerNo + "]";
 
   script.triggerControl(samplerGroup, "cue_gotoandplay");
 
+  // Use the correct MIDI-OUT channel for sampler pads (normal pad mode).
   midi.sendShortMsg(
-    status,
+    DDJFLX2.getPadLedStatus(deck.physicalDeck, false),
     control,
     engine.getValue(samplerGroup, "play") ? 0x7f : 0x00
   );
@@ -889,13 +942,19 @@ DDJFLX2.samplerStopPad = function (
     return;
   }
 
-  let pad = DDJFLX2.padNumberFromControl(control);
+  let pad = DDJFLX2.samplerPadFromControl(control);
   let deck = DDJFLX2.resolveDeck(group);
   let samplerNo = pad + (deck.physicalDeck - 1) * 8;
   let samplerGroup = "[Sampler" + samplerNo + "]";
 
   script.triggerControl(samplerGroup, "stop");
-  midi.sendShortMsg(status, control, 0x00);
+
+  // Use the correct MIDI-OUT channel for sampler stop (shifted pad mode).
+  midi.sendShortMsg(
+    DDJFLX2.getPadLedStatus(deck.physicalDeck, true),
+    control,
+    0x00
+  );
 };
 
 DDJFLX2.pfl = function (
@@ -928,6 +987,7 @@ DDJFLX2.switchLEDs = function (vDeckNo) {
   }
 
   let d = DDJFLX2.virtualToLedIndex(vDeckNo);
+  let physicalDeck = DDJFLX2.virtualToPhysicalDeck(vDeckNo);
   let vgroup = "[Channel" + vDeckNo + "]";
 
   DDJFLX2.switchPlayLED(
@@ -960,10 +1020,11 @@ DDJFLX2.switchLEDs = function (vDeckNo) {
       "hotcue_" + i + "_enabled"
     );
 
-    DDJFLX2.switchPadLED(d, i, isButtonEnabled);
+    // Use physicalDeck (not ledIndex) and correct MIDI-OUT pad channel.
+    DDJFLX2.switchPadLED(physicalDeck, i, isButtonEnabled, false);
   }
 
-  // Update loop pad LEDs (single source of truth)
+  // Update loop pad LEDs (single source of truth).
   DDJFLX2.updateLoopPadLEDs(vDeckNo);
 };
 
@@ -976,9 +1037,14 @@ DDJFLX2.switchSyncLED = function (deck, enabled) {
   midi.sendShortMsg(0x90 + deck, 0x78, 0x7f * enabled);
 };
 
-// Pad LEDs are split across separate MIDI channels per deck.
-DDJFLX2.switchPadLED = function (deck, pad, enabled) {
-  midi.sendShortMsg(0x97 + 2 * deck, pad - 1, 0x7f * enabled);
+// Send a pad LED update using the correct MIDI-OUT illumination channel.
+// physicalDeck: 1 (left) or 2 (right).
+// pad: 1-based pad number.
+// enabled: truthy = LED on, falsy = LED off.
+// shifted: true = use shifted pad LED channel (0x98 / 0x9A).
+DDJFLX2.switchPadLED = function (physicalDeck, pad, enabled, shifted) {
+  let ledStatus = DDJFLX2.getPadLedStatus(physicalDeck, shifted || false);
+  midi.sendShortMsg(ledStatus, pad - 1, enabled ? 0x7F : 0x00);
 };
 
 DDJFLX2.switchCueLED = function (deck, enabled) {
@@ -987,7 +1053,8 @@ DDJFLX2.switchCueLED = function (deck, enabled) {
 
 // Helper: turn off all loop pad LEDs for a specific physical deck.
 DDJFLX2.turnOffAllLoopPadLEDs = function (physicalDeck) {
-  let baseStatus = physicalDeck === 1 ? 0x97 : 0x99;
+  // Use the correct MIDI-OUT pad channel (normal, unshifted).
+  let baseStatus = DDJFLX2.getPadLedStatus(physicalDeck, false);
   for (let i = 0; i <= 7; i++) {
     midi.sendShortMsg(baseStatus, 0x60 + i, 0x00);
   }
@@ -1016,7 +1083,8 @@ DDJFLX2.updateLoopPadLEDs = function (vDeckNo) {
     return;
   }
 
-  let baseStatus = physicalDeck === 1 ? 0x97 : 0x99;
+  // Use the correct MIDI-OUT pad channel (normal, unshifted).
+  let baseStatus = DDJFLX2.getPadLedStatus(physicalDeck, false);
 
   midi.sendShortMsg(baseStatus, 0x60 + padIndex, 0x7f);
 };
@@ -1032,7 +1100,7 @@ DDJFLX2.loopPad = function (
     return;
   }
 
-  let pad = DDJFLX2.padNumberFromControl(control);
+  let pad = DDJFLX2.loopPadFromControl(control);
   let size = DDJFLX2.loopPadSizes[pad - 1];
   let deck = DDJFLX2.resolveDeck(group);
 
@@ -1044,7 +1112,7 @@ DDJFLX2.loopPad = function (
   let currentSize =
     DDJFLX2.activeLoopSize[deck.virtualDeck];
 
-  // Pressing same active loop disables it
+  // Pressing same active loop disables it.
   if (loopEnabled && currentSize === size) {
 
     engine.setValue(
