@@ -2,7 +2,7 @@
 <MixxxControllerPreset schemaVersion="1" mixxxVersion="2.0.0+">
     <info>
         <name>Pioneer DDJ-FLX2</name>
-        <author>RaduTek, Dan Giddins, Frank.Breitling at gmx.de</author>
+        <author>RaduTek, Dan Giddins, Frank.Breitling at gmx.de, CupoMeridio</author>
         <description>2-deck USB and Bluetooth MIDI controller with support for 4-deck mode.</description>
         <forum>https://mixxx.discourse.group/t/ddj-flx2-mapping/31083</forum>
         <manual>pioneer_ddj_flx2</manual>
@@ -11,6 +11,42 @@
         <scriptfiles>
             <file functionprefix="DDJFLX2" filename="Pioneer-DDJ-FLX2-scripts.js"/>
         </scriptfiles>
+        <!--
+            MIDI reference:
+            https://assets.pioneerdjhub.com/DDJ-FLX2_MIDI_Message_List_E1.pdf
+
+            Implemented from the Pioneer DDJ-FLX2 MIDI message list:
+            - Deck transport: play/pause, cue, Shift, Beat Sync short press,
+              Beat Sync long press, Shift + Sync pad-mode selection, tempo,
+              platter/outer jog rotation, platter touch and Shift + touch.
+            - Mixer: channel faders, crossfader, EQ high/mid/low, CFX,
+              headphone cue master/channel, master level and headphones level.
+            - Performance pads: pad mode 1 hotcues, pad mode 2 Pad FX,
+              pad mode 3 beat loops / loop rolls, pad mode 4 samplers /
+              sampler stop, including shifted pad MIDI channels.
+            - Illumination: loaded LEDs, play/cue/sync/PFL LEDs, pad LEDs,
+              loop pad LEDs, Smart Fader LED echo, and Vinyl mode setting.
+
+            Intentional Mixxx-specific behavior:
+            - The DDJ-FLX2 is a two-deck controller, but this mapping offers an
+              optional 4-deck layer mode by reusing the two physical decks for
+              virtual decks 3 and 4. This is not a Pioneer hardware feature.
+            - Smart Fader (0x96/0x01) is claimed and echoed to its LED, but
+              Mixxx has no direct Smart Fader engine control, so no rekordbox
+              Smart Fader automation is emulated here.
+            - Smart CFX (0x96/0x09 in the Pioneer reference) is not mapped.
+              Mixxx has no direct equivalent and the message is left unused.
+            - Vinyl mode cannot be changed from the FLX2 hardware. The script
+              sets Vinyl mode ON on initialization by sending MIDI OUT 9n 17 7F.
+            - Fader-start NOTE messages (0x66, 0x5D, 0x52) are not implemented.
+
+            Deliberately not mapped:
+            - No BPM TAP control is assigned to 0x60. In the Pioneer reference
+              0x60 is Pad 1 in pad mode 3, so using it as bpm_tap would collide
+              with performance pads.
+            - No Auto DJ control is assigned to 0x96/0x01 or 0x96/0x09. These
+              are Smart Fader and Smart CFX related messages in the reference.
+        -->
         <controls>
             <!-- Master Controls -->
             <control>
@@ -54,6 +90,50 @@
                 <midino>0x00</midino>
                 <options>
                     <script-binding/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>gain</key>
+                <description>Master level MSB</description>
+                <status>0xB6</status>
+                <midino>0x08</midino>
+                <options>
+                    <soft-takeover/>
+                    <fourteen-bit-msb/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>gain</key>
+                <description>Master level LSB</description>
+                <status>0xB6</status>
+                <midino>0x28</midino>
+                <options>
+                    <soft-takeover/>
+                    <fourteen-bit-lsb/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>headGain</key>
+                <description>Headphones level MSB</description>
+                <status>0xB6</status>
+                <midino>0x0D</midino>
+                <options>
+                    <soft-takeover/>
+                    <fourteen-bit-msb/>
+                </options>
+            </control>
+            <control>
+                <group>[Master]</group>
+                <key>headGain</key>
+                <description>Headphones level LSB</description>
+                <status>0xB6</status>
+                <midino>0x2D</midino>
+                <options>
+                    <soft-takeover/>
+                    <fourteen-bit-lsb/>
                 </options>
             </control>
 
@@ -144,7 +224,7 @@
             <control>
                 <group>[Channel1]</group>
                 <key>DDJFLX2.syncLong</key>
-                <description>Deck 1: Long press to toggle permanent sync</description>
+                <description>Deck 1: Hold to enable permanent sync</description>
                 <status>0x90</status>
                 <midino>0x2A</midino>
                 <options>
@@ -154,7 +234,7 @@
             <control>
                 <group>[Channel2]</group>
                 <key>DDJFLX2.syncLong</key>
-                <description>Deck 2: Long press to toggle permanent sync</description>
+                <description>Deck 2: Hold to enable permanent sync</description>
                 <status>0x91</status>
                 <midino>0x2A</midino>
                 <options>
@@ -205,7 +285,7 @@
             <control>
                 <group>[Channel2]</group>
                 <key>DDJFLX2.platterJog</key>
-                <description>Deck 2: Jog Platter (high sensitivity) - Vinyl mode</description>
+                <description>Deck 2: Jog Platter rotation, vinyl off</description>
                 <status>0xB1</status>
                 <midino>0x23</midino>
                 <options>
@@ -215,7 +295,7 @@
             <control>
                 <group>[Channel1]</group>
                 <key>DDJFLX2.platterJog</key>
-                <description>Deck 1: Jog Platter (high sensitivity) - Vinyl mode</description>
+                <description>Deck 1: Jog Platter rotation, vinyl off</description>
                 <status>0xB0</status>
                 <midino>0x23</midino>
                 <options>
@@ -244,23 +324,13 @@
             </control>
 
             <control>
-                <group>[AutoDJ]</group>
-                <key>enabled</key>
-                <description>Toggle Auto DJ On/Off</description>
+                <group>[Master]</group>
+                <key>DDJFLX2.smartFader</key>
+                <description>Smart Fader</description>
                 <status>0x96</status>
                 <midino>0x01</midino>
                 <options>
-                    <normal/>
-                </options>
-            </control>
-            <control>
-                <group>[AutoDJ]</group>
-                <key>fade_now</key>
-                <description>Trigger the transition to the next track</description>
-                <status>0x96</status>
-                <midino>0x09</midino>
-                <options>
-                    <normal/>
+                    <script-binding/>
                 </options>
             </control>
 
@@ -465,27 +535,6 @@
                 <midino>0x38</midino>
                 <options>
                     <script-binding/>
-                </options>
-            </control>
-
-            <control>
-                <group>[Channel1]</group>
-                <key>bpm_tap</key>
-                <description>Deck 1: BPM tap button</description>
-                <status>0x90</status>
-                <midino>0x60</midino>
-                <options>
-                    <normal/>
-                </options>
-            </control>
-            <control>
-                <group>[Channel2]</group>
-                <key>bpm_tap</key>
-                <description>Deck 2: BPM tap button</description>
-                <status>0x91</status>
-                <midino>0x60</midino>
-                <options>
-                    <normal/>
                 </options>
             </control>
 

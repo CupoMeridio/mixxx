@@ -1,6 +1,28 @@
-// DDJ-FLX2 controller object
-// This object contains all runtime state and MIDI handlers used by the mapping.
+// DDJ-FLX2 controller object.
+//
+// Primary hardware reference:
+// https://assets.pioneerdjhub.com/DDJ-FLX2_MIDI_Message_List_E1.pdf
+//
+// The mapping follows the Pioneer DDJ-FLX2 MIDI message list for deck controls,
+// mixer controls, performance pads, and documented illumination messages.
+// Where the FLX2 exposes rekordbox-specific functions that Mixxx does not have
+// as engine controls, the mapping either leaves the message unused or claims it
+// without emulating rekordbox-only behavior.
+//
+// Important implementation notes:
+// - The DDJ-FLX2 is physically a two-deck controller. fourDeckMode is a custom
+//   Mixxx layer that reuses the left/right hardware sides for virtual decks
+//   3 and 4. isVirtualDeckVisible() prevents hidden deck LED updates from
+//   corrupting the currently visible physical deck.
+// - Smart Fader (0x96/0x01) is claimed and echoed to its LED, but no Smart
+//   Fader automation is implemented because Mixxx has no direct equivalent.
+// - Smart CFX (0x96/0x09 in the Pioneer reference) is intentionally unmapped.
+// - Vinyl mode is set ON at startup with MIDI OUT 9n 17 7F. The controller
+//   cannot toggle Vinyl mode from the unit itself.
+// - Fader-start messages (0x66, 0x5D, 0x52) are not implemented.
+// - 0x60 is not bpm_tap; it is Pad 1 in pad mode 3.
 var DDJFLX2 = {
+  // Custom Mixxx layer mode:
   // false = physical decks control virtual decks 1 and 2
   // true  = physical decks control virtual decks 3 and 4
   fourDeckMode: false,
@@ -188,6 +210,11 @@ DDJFLX2.init = function () {
 
   DDJFLX2.LEDsOff();
 
+  // Per the Pioneer MIDI reference, Vinyl mode cannot be changed from the
+  // hardware. It is controlled by software with MIDI OUT 9n 17 hh.
+  // Keep it enabled so platter rotation uses the scratch-capable 0x22 path.
+  DDJFLX2.setVinylMode(true);
+
   // Focus the library after startup.
   // A short delay avoids initialization timing issues.
   engine.beginTimer(
@@ -210,6 +237,10 @@ DDJFLX2.shutdown = function () {
 };
 
 DDJFLX2.LEDsOff = function () {
+  // Smart Fader LED. Smart CFX (0x96/0x09) is intentionally not touched
+  // because it is not mapped in Mixxx.
+  midi.sendShortMsg(0x96, 0x01, 0x00);
+
   // Turn off all LEDs for both physical decks.
   for (let i = 0; i <= 1; i++) {
     midi.sendShortMsg(0x96 + i, 0x63, 0x00);
@@ -250,6 +281,14 @@ DDJFLX2.updateDeckLeds = function (vgroup, value) {
 DDJFLX2.switchLoadedLED = function (vDeckNo, loaded) {
   // Dedicated hardware LEDs for track loaded state.
   midi.sendShortMsg(0x9f, vDeckNo - 1, loaded ? 0x7f : 0x00);
+};
+
+DDJFLX2.setVinylMode = function (enabled) {
+  // Pioneer setting message: deck 1/2 MIDI OUT 9n 17 hh.
+  // enabled=true selects Vinyl mode ON; enabled=false selects Vinyl mode OFF.
+  for (let deck = 0; deck <= 1; deck++) {
+    midi.sendShortMsg(0x90 + deck, 0x17, enabled ? 0x7f : 0x00);
+  }
 };
 
 DDJFLX2.LoadSelectedTrack = function (
@@ -416,7 +455,7 @@ DDJFLX2.headmix = function (channel, control, value) {
 
   // Toggle between cue and master monitoring extremes.
   let masterMixEnabled =
-    engine.getValue("[Master]", "headMix") > 0;
+    engine.getValue("[Master]", "headMix") > 0.5;
 
   engine.setValue(
     "[Master]",
@@ -519,6 +558,19 @@ DDJFLX2.syncShort = function (
   }
 };
 
+DDJFLX2.smartFader = function (
+  channel,
+  control,
+  value,
+  status,
+  group
+) {
+  // The FLX2 reports Smart Fader on 0x96/0x01, but Mixxx has no matching
+  // engine control yet. Keep the MIDI message claimed so it does not trigger
+  // unrelated behavior.
+  midi.sendShortMsg(0x96, 0x01, value ? 0x7f : 0x00);
+};
+
 DDJFLX2.syncLong = function (
   channel,
   control,
@@ -529,19 +581,11 @@ DDJFLX2.syncLong = function (
   if (DDJFLX2.isShiftPressed(group)) {
     return;
   }
+
   if (value) {
     let deck = DDJFLX2.resolveDeck(group);
-
-    const enabled = engine.getValue(
-      deck.group,
-      "sync_enabled"
-    );
-
-    engine.setValue(
-      deck.group,
-      "sync_enabled",
-      enabled ? 0 : 1
-    );
+    let enabled = engine.getValue(deck.group, "sync_enabled");
+    engine.setValue(deck.group, "sync_enabled", enabled ? 0 : 1);
   }
 };
 
@@ -1053,10 +1097,8 @@ DDJFLX2.switchCueLED = function (deck, enabled) {
 
 // Helper: turn off all loop pad LEDs for a specific physical deck.
 DDJFLX2.turnOffAllLoopPadLEDs = function (physicalDeck) {
-  // Use the correct MIDI-OUT pad channel (normal, unshifted).
-  let baseStatus = DDJFLX2.getPadLedStatus(physicalDeck, false);
-  for (let i = 0; i <= 7; i++) {
-    midi.sendShortMsg(baseStatus, 0x60 + i, 0x00);
+  for (let pad = 1; pad <= 8; pad++) {
+    DDJFLX2.switchPadLED(physicalDeck, pad, false, false);
   }
 };
 
@@ -1083,10 +1125,7 @@ DDJFLX2.updateLoopPadLEDs = function (vDeckNo) {
     return;
   }
 
-  // Use the correct MIDI-OUT pad channel (normal, unshifted).
-  let baseStatus = DDJFLX2.getPadLedStatus(physicalDeck, false);
-
-  midi.sendShortMsg(baseStatus, 0x60 + padIndex, 0x7f);
+  DDJFLX2.switchPadLED(physicalDeck, padIndex + 1, true, false);
 };
 
 DDJFLX2.loopPad = function (
